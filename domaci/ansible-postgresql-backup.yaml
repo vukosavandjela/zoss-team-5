@@ -1,0 +1,137 @@
+---
+# ============================================================
+# PostgreSQL Backup Playbook
+# ============================================================
+- name: PostgreSQL Database Backup
+  hosts: metasploitable
+  become: yes
+  vars:
+    db_name: testdb                  # ← IME BAZE ZA BACKUP
+    db_user: postgres
+    backup_dir: /opt/backups/postgresql
+    timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
+    backup_filename: "{{ db_name }}_backup_{{ timestamp }}.sql"
+    compressed_filename: "{{ backup_filename }}.gz"
+    retention_days: 7 #brisanje 
+  tasks:
+    # TASK 1: Proveri PostgreSQL servis
+    - name: Check if PostgreSQL service is running
+      service:
+        name: postgresql
+        state: started
+      register: postgres_status
+    - name: Display PostgreSQL service status
+      debug:
+        msg: "PostgreSQL is {{ postgres_status.state }}"
+    # TASK 2: Kreiraj backup direktorijum
+    - name: Create backup directory
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: '0755'
+        owner: postgres
+        group: postgres
+    # TASK 3: Proveri da li baza postoji
+    - name: Check if database exists
+      shell: sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw {{ db_name }}
+      register: db_check
+      ignore_errors: yes
+      changed_when: false
+    - name: Fail if database doesn't exist
+      fail:
+        msg: "Database '{{ db_name }}' does not exist!"
+      when: db_check.rc != 0
+    # TASK 4: Napravi SQL dump (backup - pravljenje kopije)
+    - name: Create PostgreSQL database dump
+      shell: sudo -u postgres pg_dump {{ db_name }} > {{ backup_dir }}/{{ backup_filename }}
+      args:
+        creates: "{{ backup_dir }}/{{ backup_filename }}"
+    - name: Display backup file location
+      debug:
+        msg: "Backup created: {{ backup_dir }}/{{ backup_filename }}"
+    # TASK 5: Kompresuj backup
+    - name: Compress backup file with gzip
+      shell: gzip -f {{ backup_dir }}/{{ backup_filename }}
+      args:
+        creates: "{{ backup_dir }}/{{ compressed_filename }}"
+    # TASK 6: Proveri veličinu backup-a
+    - name: Get backup file stats
+      stat: #modul za prikupljanje metapodataka o fajlu
+        path: "{{ backup_dir }}/{{ compressed_filename }}"
+      register: backup_file_stat
+    - name: Show backup file size
+      debug:
+        msg: "Compressed backup size: {{ (backup_file_stat.stat.size / 1024.0) | round(2) }} KB"
+    # TASK 7: Generiši SHA256 checksum
+    - name: Calculate SHA256 checksum of backup
+      stat:
+        path: "{{ backup_dir }}/{{ compressed_filename }}"
+        checksum_algorithm: sha256
+        get_checksum: yes
+      register: backup_checksum
+    - name: Save checksum to file
+      copy:
+        content: |
+          Backup File: {{ compressed_filename }}
+          SHA256: {{ backup_checksum.stat.checksum }}
+          Size: {{ backup_file_stat.stat.size }} bytes
+          Created: {{ ansible_date_time.iso8601 }}
+          Database: {{ db_name }}
+        dest: "{{ backup_dir }}/{{ compressed_filename }}.sha256"
+        mode: '0644'
+    - name: Display backup checksum
+      debug:
+        msg: "Backup SHA256: {{ backup_checksum.stat.checksum }}"
+    # TASK 8: Čišćenje starih backup-a
+    - name: Find old backup files
+      find:
+        paths: "{{ backup_dir }}"
+        patterns: "{{ db_name }}_backup_*.sql.gz"
+        age: "{{ retention_days }}d"
+        age_stamp: mtime
+      register: old_backups
+    - name: Delete old backup files
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_backups.files }}"
+      when: old_backups.files | length > 0
+    - name: Display cleanup results
+      debug:
+        msg: "Deleted {{ old_backups.files | length }} old backup(s)"
+    # TASK 9: Kreiraj manifest
+    - name: Create backup manifest
+      copy:
+        content: |
+          ====================================
+          PostgreSQL Backup Manifest
+          ====================================
+          Backup Details:
+          ---------------
+          Hostname: {{ ansible_hostname }}
+          Database Name: {{ db_name }}
+          Backup Timestamp: {{ ansible_date_time.iso8601 }}
+          Operator: {{ ansible_user_id }}
+          File Information:
+          -----------------
+          Backup File: {{ compressed_filename }}
+          Full Path: {{ backup_dir }}/{{ compressed_filename }}
+          File Size: {{ (backup_file_stat.stat.size / 1024.0) | round(2) }} KB
+          SHA256 Checksum: {{ backup_checksum.stat.checksum }}
+
+          Retention Policy:
+          -----------------
+          Retention Period: {{ retention_days }} days
+          Old Backups Deleted: {{ old_backups.files | length }}
+          Status: SUCCESS 
+        dest: "{{ backup_dir }}/BACKUP_MANIFEST_{{ timestamp }}.txt"
+        mode: '0644'
+    - name: Display success message
+      debug:
+        msg: |
+          ============================================
+           BACKUP COMPLETED SUCCESSFULLY!
+          ============================================
+          Backup Location: {{ backup_dir }}/{{ compressed_filename }}
+          Backup Size: {{ (backup_file_stat.stat.size / 1024.0) | round(2) }} KB
+          SHA256 Hash: {{ backup_checksum.stat.checksum }}

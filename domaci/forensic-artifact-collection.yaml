@@ -1,0 +1,443 @@
+---
+# ============================================================
+# Forensic Artifact Collection - Drupalgeddon Incident
+# ============================================================
+# Namena: Sakuplja dokaze posle Drupalgeddon CVE-2014-3704 napada
+# Datum: 2024-12-22
+# ============================================================
+
+- name: Incident Response - Drupalgeddon Forensic Collection
+  hosts: metasploitable
+  become: yes
+  
+  vars:
+    # Konfiguracija
+    incident_id: "DRUPAL-{{ ansible_date_time.epoch }}"
+    collection_dir: "/opt/forensic/drupal-incident/{{ ansible_hostname }}_{{ ansible_date_time.epoch }}"
+    drupal_path: "/var/www/html"  
+    
+  tasks:
+    # ===== TASK 1: Kreiraj Forensic Direktorijum =====
+    - name: Create forensic collection directory
+      file:
+        path: "{{ collection_dir }}"
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root
+    
+    - name: Display collection directory
+      debug:
+        msg: "Evidence collection directory: {{ collection_dir }}"
+    
+    # ===== TASK 2: System Information =====
+    - name: Collect system information
+      block:
+        - name: Get hostname and IP addresses
+          shell: |
+            echo "=== SYSTEM INFORMATION ===" > {{ collection_dir }}/system_info.txt
+            echo "Hostname: $(hostname)" >> {{ collection_dir }}/system_info.txt
+            echo "IP Addresses: $(hostname -I)" >> {{ collection_dir }}/system_info.txt
+            echo "Uptime: $(uptime)" >> {{ collection_dir }}/system_info.txt
+            echo "Kernel: $(uname -a)" >> {{ collection_dir }}/system_info.txt
+            echo "Date/Time: $(date)" >> {{ collection_dir }}/system_info.txt
+            echo "" >> {{ collection_dir }}/system_info.txt
+        
+        - name: Get OS information
+          shell: cat /etc/os-release >> {{ collection_dir }}/system_info.txt
+          ignore_errors: yes
+    
+    # ===== TASK 3: Volatile Data - Procesi =====
+    #Detekcija Metasloit payload-a 
+    - name: Collect running processes
+      block:
+        - name: Get full process list (ps auxeww)
+          shell: ps auxeww > {{ collection_dir }}/process_list.txt
+          # auxeww pokazuje SVE procese sa punim komandama i env varijablama
+
+        - name: Get process tree
+          shell: pstree -ap > {{ collection_dir }}/process_tree.txt
+          ignore_errors: yes
+        
+        - name: Find suspicious PHP/Apache processes
+          shell: |
+            echo "=== SUSPICIOUS PHP PROCESSES ===" > {{ collection_dir }}/suspicious_processes.txt
+            ps aux | grep -E "php|apache2|www-data" | grep -v grep >> {{ collection_dir }}/suspicious_processes.txt
+          ignore_errors: yes
+    
+    # ===== TASK 4: Mrežne Konekcije =====
+    - name: Collect network connections
+      block:
+        - name: Get all network connections (netstat)
+          shell: netstat -tunap > {{ collection_dir }}/network_connections.txt
+          ignore_errors: yes
+        
+        - name: Get listening ports
+          shell: netstat -tulpn > {{ collection_dir }}/listening_ports.txt
+          ignore_errors: yes
+        
+        - name: Get established connections (suspicious)
+          shell: |
+            echo "=== ESTABLISHED CONNECTIONS ===" > {{ collection_dir }}/established_connections.txt
+            netstat -tunap | grep ESTABLISHED >> {{ collection_dir }}/established_connections.txt
+          ignore_errors: yes
+        
+        - name: Get routing table
+          shell: route -n > {{ collection_dir }}/routing_table.txt
+          ignore_errors: yes
+    
+    # ===== TASK 5: Apache/Web Server Logs =====
+    #Za detekciju Drupalgeddon exploit-a!
+    - name: Collect Apache logs
+      block:
+        - name: Archive Apache access logs
+          shell: |
+            if [ -d /var/log/apache2 ]; then
+              tar czf {{ collection_dir }}/apache_logs.tar.gz /var/log/apache2/*.log 2>/dev/null || true
+            elif [ -d /var/log/httpd ]; then
+              tar czf {{ collection_dir }}/apache_logs.tar.gz /var/log/httpd/*.log 2>/dev/null || true
+            fi
+          ignore_errors: yes
+        
+        - name: Extract Drupal-specific attacks from access log
+          shell: |
+            echo "=== DRUPAL EXPLOIT ATTEMPTS ===" > {{ collection_dir }}/drupal_attacks.txt
+            if [ -f /var/log/apache2/access.log ]; then
+              grep -E "drupal|POST.*node|destination=node" /var/log/apache2/access.log >> {{ collection_dir }}/drupal_attacks.txt 2>/dev/null || true
+            fi
+            if [ -f /var/log/httpd/access_log ]; then
+              grep -E "drupal|POST.*node|destination=node" /var/log/httpd/access_log >> {{ collection_dir }}/drupal_attacks.txt 2>/dev/null || true
+            fi
+          ignore_errors: yes
+        
+        - name: Find POST requests (exploit vector)
+          shell: |
+            echo "=== POST REQUESTS ===" > {{ collection_dir }}/post_requests.txt
+            if [ -f /var/log/apache2/access.log ]; then
+              grep "POST" /var/log/apache2/access.log | tail -100 >> {{ collection_dir }}/post_requests.txt
+            fi
+          ignore_errors: yes
+    
+    # ===== TASK 6: Drupal Specific Files =====
+    - name: Collect Drupal installation
+      block:
+        - name: Check if Drupal directory exists
+          stat:
+            path: "{{ drupal_path }}"
+          register: drupal_dir
+        
+        - name: Archive Drupal directory (if exists)
+          shell: tar czf {{ collection_dir }}/drupal_files.tar.gz {{ drupal_path }}
+          when: drupal_dir.stat.exists
+          ignore_errors: yes
+        
+        - name: Find recently modified PHP files in web root
+          find:
+            paths:
+              - "{{ drupal_path }}"
+              - /var/www
+            patterns: "*.php"
+            age: "7d"
+            recurse: yes
+          register: recent_php_files
+          ignore_errors: yes
+        
+        - name: Save recently modified PHP files list
+          copy:
+            content: "{{ recent_php_files.files | map(attribute='path') | join('\n') }}"
+            dest: "{{ collection_dir }}/recent_php_files.txt"
+          when: recent_php_files.files is defined
+    
+    # ===== TASK 7: Uploaded Files & Temporary Files =====
+    - name: Collect suspicious uploaded files
+      block:
+        - name: Find files in /tmp
+          find:
+            paths: /tmp
+            age: "7d"
+            recurse: yes
+          register: tmp_files
+          ignore_errors: yes
+        
+        - name: Save /tmp file listing
+          copy:
+            content: "{{ tmp_files.files | to_nice_yaml }}"
+            dest: "{{ collection_dir }}/tmp_files.yaml"
+          when: tmp_files.files is defined
+        
+        - name: Archive /tmp directory
+          shell: tar czf {{ collection_dir }}/tmp_directory.tar.gz /tmp 2>/dev/null || true
+          ignore_errors: yes
+        
+        - name: Find suspicious scripts (shell scripts)
+          shell: |
+            echo "=== SUSPICIOUS SCRIPTS ===" > {{ collection_dir }}/suspicious_scripts.txt
+            find /tmp /var/tmp /dev/shm -type f -name "*.sh" -o -name "*.php" -o -name "*.py" 2>/dev/null >> {{ collection_dir }}/suspicious_scripts.txt || true
+          ignore_errors: yes
+    
+    # ===== TASK 8: User Activity & Shell History =====
+    - name: Collect user activity
+      block:
+        - name: Get currently logged in users
+          shell: w > {{ collection_dir }}/logged_in_users.txt
+        
+        - name: Get login history
+          shell: last -a > {{ collection_dir }}/login_history.txt
+        
+        - name: Collect bash history for www-data user
+          shell: |
+            echo "=== WWW-DATA BASH HISTORY ===" > {{ collection_dir }}/www-data_bash_history.txt
+            if [ -f /var/www/.bash_history ]; then
+              cat /var/www/.bash_history >> {{ collection_dir }}/www-data_bash_history.txt
+            fi
+            if [ -f /home/www-data/.bash_history ]; then
+              cat /home/www-data/.bash_history >> {{ collection_dir }}/www-data_bash_history.txt
+            fi
+          ignore_errors: yes
+        
+        - name: Collect bash history for all users
+          shell: |
+            echo "=== ALL USERS BASH HISTORY ===" > {{ collection_dir }}/all_bash_history.txt
+            for user_home in /home/*; do
+              if [ -f "$user_home/.bash_history" ]; then
+                echo "--- $user_home ---" >> {{ collection_dir }}/all_bash_history.txt
+                cat "$user_home/.bash_history" >> {{ collection_dir }}/all_bash_history.txt
+                echo "" >> {{ collection_dir }}/all_bash_history.txt
+              fi
+            done
+          ignore_errors: yes
+    
+    # ===== TASK 9: Persistence Mechanisms =====
+    #mehanizmi otkrivanja crontab (cron jobova www data usera)
+    #pokusaji ubacanja scheduling naredbi recimo uspostavljanja reverse tcp konekcije
+    - name: Collect persistence mechanisms
+      block:
+        - name: Collect all crontabs
+          shell: |
+            echo "=== SYSTEM CRONTAB ===" > {{ collection_dir }}/crontabs.txt
+            cat /etc/crontab >> {{ collection_dir }}/crontabs.txt 2>/dev/null || true
+            echo "" >> {{ collection_dir }}/crontabs.txt
+            echo "=== USER CRONTABS ===" >> {{ collection_dir }}/crontabs.txt
+            for user in $(cut -f1 -d: /etc/passwd); do
+              echo "--- Crontab for $user ---" >> {{ collection_dir }}/crontabs.txt
+              crontab -u $user -l >> {{ collection_dir }}/crontabs.txt 2>/dev/null || echo "No crontab" >> {{ collection_dir }}/crontabs.txt
+              echo "" >> {{ collection_dir }}/crontabs.txt
+            done
+          ignore_errors: yes
+        
+        - name: Check startup scripts
+          shell: |
+            echo "=== STARTUP SCRIPTS ===" > {{ collection_dir }}/startup_scripts.txt
+            ls -la /etc/rc*.d/ >> {{ collection_dir }}/startup_scripts.txt 2>/dev/null || true
+            echo "" >> {{ collection_dir }}/startup_scripts.txt
+            ls -la /etc/init.d/ >> {{ collection_dir }}/startup_scripts.txt 2>/dev/null || true
+          ignore_errors: yes
+    
+    # ===== TASK 10: Auditd Logs =====
+    - name: Collect auditd logs (if exists)
+      block:
+        - name: Check if auditd is installed
+          stat:
+            path: /var/log/audit
+          register: auditd_dir
+        
+        - name: Archive auditd logs
+          shell: tar czf {{ collection_dir }}/auditd_logs.tar.gz /var/log/audit/ 2>/dev/null || true
+          when: auditd_dir.stat.exists
+          ignore_errors: yes
+        
+        - name: Search auditd for suspicious activity
+          shell: |
+            if [ -d /var/log/audit ]; then
+              echo "=== AUDITD SUSPICIOUS ACTIVITY ===" > {{ collection_dir }}/auditd_suspicious.txt
+              ausearch -k execution -ts recent >> {{ collection_dir }}/auditd_suspicious.txt 2>/dev/null || true
+              ausearch -k identity -ts recent >> {{ collection_dir }}/auditd_suspicious.txt 2>/dev/null || true
+            fi
+          when: auditd_dir.stat.exists
+          ignore_errors: yes
+    
+    # ===== TASK 11: System Logs =====
+    - name: Collect system logs
+      block:
+        - name: Archive /var/log directory
+          shell: tar czf {{ collection_dir }}/system_logs.tar.gz /var/log/ --exclude='*.gz' --exclude='*.1' 2>/dev/null || true
+          ignore_errors: yes
+        
+        - name: Collect auth.log (login attempts)
+          shell: |
+            if [ -f /var/log/auth.log ]; then
+              cp /var/log/auth.log {{ collection_dir }}/auth.log
+            fi
+          ignore_errors: yes
+        
+        - name: Collect syslog
+          shell: |
+            if [ -f /var/log/syslog ]; then
+              cp /var/log/syslog {{ collection_dir }}/syslog
+            fi
+          ignore_errors: yes
+    
+    # ===== TASK 12: File Hashes (Integrity Check) =====
+    - name: Calculate file hashes for evidence integrity
+      block:
+        - name: Generate SHA256 hashes for all collected evidence
+          shell: |
+            cd {{ collection_dir }}
+            find . -type f -exec sha256sum {} \; > {{ collection_dir }}/evidence_hashes.sha256
+          ignore_errors: yes
+        
+        - name: Create hash manifest
+          shell: |
+            echo "=== FILE INTEGRITY HASHES ===" > {{ collection_dir }}/HASHES.txt
+            cat {{ collection_dir }}/evidence_hashes.sha256 >> {{ collection_dir }}/HASHES.txt
+          ignore_errors: yes
+    
+    # ===== TASK 13: Incident Timeline =====
+    - name: Create incident timeline
+      shell: |
+        cat << EOF > {{ collection_dir }}/INCIDENT_TIMELINE.txt
+        ====================================
+        INCIDENT TIMELINE - Drupalgeddon Attack
+        ====================================
+        
+        Incident ID: {{ incident_id }}
+        
+        Collection Details:
+        -------------------
+        Collection Time: {{ ansible_date_time.iso8601 }}
+        Collected By: {{ ansible_user_id }}
+        Target Host: {{ ansible_hostname }}
+        IP Addresses: $(hostname -I)
+        
+        Attack Vector:
+        --------------
+        CVE: CVE-2014-3704 (Drupalgeddon)
+        Attack Type: SQL Injection in Drupal 7.x
+        Exploit Method: POST request to vulnerable Drupal endpoint
+        
+        Evidence Collected:
+        -------------------
+        [✓] System Information
+        [✓] Running Processes (including PHP/Apache)
+        [✓] Network Connections (reverse shells)
+        [✓] Apache/Web Server Logs
+        [✓] Drupal Installation Files
+        [✓] Uploaded/Temporary Files
+        [✓] User Activity & Bash History
+        [✓] Persistence Mechanisms (crontab)
+        [✓] Auditd Logs (if available)
+        [✓] System Logs
+        [✓] File Integrity Hashes (SHA256)
+        
+        Next Steps:
+        -----------
+        1. Analyze Apache logs for initial exploit attempt
+        2. Review process list for malicious PHP/shell processes
+        3. Check network connections for reverse shells
+        4. Examine uploaded files in /tmp and Drupal directories
+        5. Review bash history for post-exploitation commands
+        6. Compare file hashes with known-good baseline
+        
+        Chain of Custody:
+        -----------------
+        Evidence Location: {{ collection_dir }}
+        Evidence Hash File: {{ collection_dir }}/evidence_hashes.sha256
+        Manifest: {{ collection_dir }}/FORENSIC_MANIFEST.txt
+        EOF
+    
+    # ===== TASK 14: Forensic Manifest (Chain of Custody) =====
+    - name: Create forensic manifest
+      shell: |
+        cat << EOF > {{ collection_dir }}/FORENSIC_MANIFEST.txt
+        ====================================
+        FORENSIC COLLECTION MANIFEST
+        ====================================
+        
+        Incident Information:
+        ---------------------
+        Incident ID: {{ incident_id }}
+        Incident Type: Drupalgeddon (CVE-2014-3704) Web Exploitation
+        Target System: {{ ansible_hostname }}
+        IP Addresses: $(hostname -I)
+        
+        Collection Metadata:
+        --------------------
+        Collection Timestamp: {{ ansible_date_time.iso8601 }}
+        Operator: {{ ansible_user_id }}
+        Playbook: forensic-collection-drupal.yml
+        Ansible Version: $(ansible --version | head -1)
+        
+        Evidence Files Collected:
+        -------------------------
+        $(ls -lh {{ collection_dir }} | tail -n +2)
+        
+        Evidence Integrity:
+        -------------------
+        Hash Algorithm: SHA256
+        Hash File: evidence_hashes.sha256
+        Collection Directory Hash: $(find {{ collection_dir }} -type f -exec sha256sum {} \; | sha256sum | awk '{print $1}')
+        
+        Legal Notice:
+        -------------
+        This evidence was collected as part of an incident response
+        investigation. All files have been preserved with cryptographic
+        hashes to maintain chain of custody and evidence integrity.
+        
+        Preservation Notes:
+        -------------------
+        - All original files preserved with timestamps
+        - No modifications made to source system during collection
+        - Read-only operations used where possible
+        - Cryptographic hashes calculated for all evidence
+        - Secure permissions (0700) applied to evidence directory
+        
+        Analyst Notes:
+        --------------
+        Focus Areas:
+        1. Apache access logs - Look for POST to /drupal/?q=node&destination=node
+        2. Process list - Identify PHP shells or suspicious processes
+        3. Network connections - Find reverse shell connections
+        4. /tmp directory - Check for uploaded exploitation tools
+        5. www-data bash history - Commands executed by attacker
+        
+        Status: COLLECTION COMPLETE 
+        EOF
+    
+    # ===== TASK 15: Final Summary =====
+    - name: Calculate total evidence size
+      shell: du -sh {{ collection_dir }} | awk '{print $1}'
+      register: evidence_size
+    
+    - name: Count evidence files
+      shell: find {{ collection_dir }} -type f | wc -l
+      register: evidence_count
+    
+    - name: Display collection summary
+      debug:
+        msg: |
+          ================================================
+           FORENSIC COLLECTION COMPLETED!
+          ================================================
+          
+          Incident ID: {{ incident_id }}
+          Evidence Location: {{ collection_dir }}
+          Total Size: {{ evidence_size.stdout }}
+          Files Collected: {{ evidence_count.stdout }}
+          
+          Key Evidence Files:
+          -------------------
+          - Apache Logs: {{ collection_dir }}/apache_logs.tar.gz
+          - Drupal Attacks: {{ collection_dir }}/drupal_attacks.txt
+          - Process List: {{ collection_dir }}/process_list.txt
+          - Network Connections: {{ collection_dir }}/network_connections.txt
+          - Bash History: {{ collection_dir }}/all_bash_history.txt
+          - File Hashes: {{ collection_dir }}/evidence_hashes.sha256
+          
+          Manifests:
+          ----------
+          - Incident Timeline: {{ collection_dir }}/INCIDENT_TIMELINE.txt
+          - Forensic Manifest: {{ collection_dir }}/FORENSIC_MANIFEST.txt
+          - Hash Manifest: {{ collection_dir }}/HASHES.txt
+          
+          To retrieve evidence from server:
+          scp -r vagrant@192.168.1.104:{{ collection_dir }} ~/evidence/

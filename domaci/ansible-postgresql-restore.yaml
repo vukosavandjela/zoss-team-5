@@ -1,0 +1,157 @@
+---
+# ============================================================
+# PostgreSQL Restore Playbook
+# ============================================================
+- name: PostgreSQL Database Restore
+  hosts: metasploitable
+  become: yes
+  vars:
+    db_name: testdb
+    db_user: postgres
+    backup_dir: /opt/backups/postgresql
+    restore_file: "{{ restore_file | default('') }}"
+  pre_tasks: #za validaciju i pripremu
+    - name: Verify restore_file parameter is provided
+      fail:
+        msg: |
+          ERROR: restore_file parameter is required!
+          Usage:
+          ansible-playbook -i inventory.yml playbooks/postgresql-restore.yml -e "restore_file=testdb_backup_XXXXXX.sql.gz"
+      when: restore_file == ''
+    - name: Check if backup file exists
+      stat:
+        path: "{{ backup_dir }}/{{ restore_file }}"
+      register: backup_file_check
+    - name: Fail if backup file doesn't exist
+      fail:
+        msg: "Backup file not found: {{ backup_dir }}/{{ restore_file }}"
+      when: not backup_file_check.stat.exists
+  tasks:
+    # TASK 1: Proveri PostgreSQL
+    - name: Ensure PostgreSQL is running
+      service:
+        name: postgresql
+        state: started
+    # TASK 2: Verifikuj integritet
+    - name: Verify backup file integrity (SHA256)
+      stat:
+        path: "{{ backup_dir }}/{{ restore_file }}"
+        checksum_algorithm: sha256
+        get_checksum: yes
+      register: current_checksum
+    - name: Check if original checksum file exists
+      stat:
+        path: "{{ backup_dir }}/{{ restore_file }}.sha256"
+      register: checksum_file
+    - name: Read original checksum
+      shell: grep "SHA256:" {{ backup_dir }}/{{ restore_file }}.sha256 | awk '{print $2}'
+      register: original_checksum_output
+      when: checksum_file.stat.exists
+      changed_when: false
+    - name: Set original checksum fact
+      set_fact:
+        original_sha256: "{{ original_checksum_output.stdout }}"
+      when: checksum_file.stat.exists
+    - name: Compare checksums
+      debug:
+        msg: |
+          Current SHA256:  {{ current_checksum.stat.checksum }}
+          Original SHA256: {{ original_sha256 | default('N/A') }}
+          Match: {{ current_checksum.stat.checksum == original_sha256 | default(false) }}
+    - name: Fail if checksums don't match
+      fail:
+        msg: " INTEGRITY CHECK FAILED! Backup may be corrupted!"
+      when:
+        - checksum_file.stat.exists
+        - current_checksum.stat.checksum != original_sha256
+    - name: Integrity check passed
+      debug:
+        msg: "Backup integrity verified!"
+      when:
+        - checksum_file.stat.exists
+        - current_checksum.stat.checksum == original_sha256
+    # TASK 3: Safety backup
+    - name: Create safety backup of current database
+      #cuva se trenutno stanje baze (u slucaju da dodje do greske prilikom restorea, preventivno)
+      shell: sudo -u postgres pg_dump {{ db_name }} | gzip > {{ backup_dir }}/{{ db_name }}_pre_restore_{{ ansible_date_time.epoch }}.sql.gz 
+      ignore_errors: yes
+      register: safety_backup
+    - name: Display safety backup location
+      debug:
+        msg: "Safety backup: {{ backup_dir }}/{{ db_name }}_pre_restore_{{ ansible_date_time.epoch }}.sql.gz"
+      when: safety_backup.rc == 0
+    # TASK 4: Zatvori konekcije
+    - name: Terminate all connections to database
+      shell: |
+        sudo -u postgres psql -c "SELECT pg_terminate_backend(pg_stat_activity.pid) FROM pg_stat_activity WHERE pg_stat_activity.datname = '{{ db_name }}' AND pid <> pg_backend_pid();"
+      ignore_errors: yes
+    # TASK 5: Obriši bazu
+    - name: Drop existing database
+      shell: sudo -u postgres dropdb {{ db_name }}
+      ignore_errors: yes
+    - name: Confirm database dropped
+      debug:
+        msg: "Database '{{ db_name }}' has been dropped"
+    # TASK 6: Kreiraj novu bazu
+    - name: Create fresh database
+      shell: sudo -u postgres createdb {{ db_name }}
+    # TASK 7: Dekompresu-j backup
+    - name: Decompress backup file
+      shell: gunzip -c {{ backup_dir }}/{{ restore_file }} > /tmp/restore_temp.sql
+    # TASK 8: Restore baze
+    - name: Restore database from SQL dump
+      shell: sudo -u postgres psql {{ db_name }} < /tmp/restore_temp.sql
+      register: restore_result
+    - name: Display restore result
+      debug:
+        msg: "Database '{{ db_name }}' restored successfully!"
+    # TASK 9: Obriši temp fajl
+    - name: Clean up temporary SQL file
+      file:
+        path: /tmp/restore_temp.sql
+        state: absent
+    # TASK 10: Verifikuj restore
+    - name: Verify database exists and is accessible
+      shell: sudo -u postgres psql -d {{ db_name }} -c "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';"
+      register: table_count
+      changed_when: false
+    - name: Display verification results
+      debug:
+        msg: |
+          RESTORE VERIFICATION:
+          Database: {{ db_name }}
+          Tables found: {{ table_count.stdout_lines[2] | trim }}
+          Status: Database is accessible 
+    # TASK 11: Kreiraj manifest
+    - name: Create restore manifest
+      copy:
+        content: |
+          ====================================
+          PostgreSQL Restore Manifest
+          ====================================
+          Restore Details:
+          ----------------
+          Hostname: {{ ansible_hostname }}
+          Database Name: {{ db_name }}
+          Restore Timestamp: {{ ansible_date_time.iso8601 }}
+          Operator: {{ ansible_user_id }}
+          Source Backup:
+          --------------
+          Backup File: {{ restore_file }}
+          SHA256 (Current): {{ current_checksum.stat.checksum }}
+          SHA256 (Original): {{ original_sha256 | default('N/A') }}
+          Integrity Check: {{ 'PASSED' if (checksum_file.stat.exists and current_checksum.stat.checksum == original_sha256) else 'N/A' }}
+          Safety Backup:
+          --------------
+          Pre-Restore Backup: {{ backup_dir }}/{{ db_name }}_pre_restore_{{ ansible_date_time.epoch }}.sql.gz
+          Status: SUCCESS 
+        dest: "{{ backup_dir }}/RESTORE_MANIFEST_{{ ansible_date_time.epoch }}.txt"
+        mode: '0644'
+    - name: Display final success message
+      debug:
+        msg: |
+          ================================================
+           DATABASE RESTORE COMPLETED SUCCESSFULLY!
+          ================================================
+          Database: {{ db_name }}
+          Source: {{ restore_file }}
